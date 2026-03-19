@@ -6,6 +6,8 @@ import time
 import pulp
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error
+from difflib import get_close_matches
+from io import StringIO
 
 st.set_page_config(page_title="FPL xP Tool", layout="wide", page_icon="⚽")
 
@@ -42,32 +44,43 @@ API     = "https://fantasy.premierleague.com/api"
 POS_MAP = {1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'}
 
 ALL_CHIPS = {
-    'wildcard': ('Wildcard',       '2× per season'),
-    'bboost':   ('Bench Boost',    '1× per season'),
-    'freehit':  ('Free Hit',       '1× per season'),
-    '3xc':      ('Triple Captain', '1× per season'),
+    'wildcard': 'Wildcard',
+    'bboost':   'Bench Boost',
+    'freehit':  'Free Hit',
+    '3xc':      'Triple Captain',
 }
 
-# Feature set from the original (proven accurate) — kept exactly.
-# opp_gc_rolling5 is a strong defensive signal included in build_features.
+# Full feature set — original proven base + home/away splits + minutes trend
+# + direct goal/assist rolling + season-aware opponent GC
 FEATURE_COLS = [
-    'pts_avg_3', 'pts_avg_5', 'pts_avg_10',
-    'xg_avg_3',  'xg_avg_5',  'xg_avg_10',
-    'xa_avg_3',  'xa_avg_5',  'xa_avg_10',
-    'xgi_avg_3', 'xgi_avg_5',
-    'mins_avg_3', 'mins_avg_5',
-    'bonus_avg_3', 'bonus_avg_5',
-    'minutes_ratio', 'is_home',
+    'pts_avg_3',    'pts_avg_5',    'pts_avg_10',
+    'xg_avg_3',     'xg_avg_5',     'xg_avg_10',
+    'xa_avg_3',     'xa_avg_5',     'xa_avg_10',
+    'xgi_avg_3',    'xgi_avg_5',
+    'mins_avg_3',   'mins_avg_5',
+    'bonus_avg_3',  'bonus_avg_5',
+    'goals_avg_3',  'goals_avg_5',
+    'assists_avg_3',
+    'pts_home_avg5', 'pts_away_avg5',
+    'minutes_ratio', 'mins_trend',
+    'is_home',
     'opp_attack_norm', 'opp_defence_norm',
     'opp_gc_rolling5',
     'price_norm', 'cs_rolling5',
 ]
 
-# Difficulty multiplier applied to captain score only — not to raw xP predictions
-DIFF_MULT = {1: 1.4, 2: 1.2, 3: 1.0, 4: 0.5, 5: 0.2}
+DIFF_MULT           = {1: 1.4, 2: 1.2, 3: 1.0, 4: 0.5, 5: 0.2}
+BASELINE_GOAL_PROB  = {'FWD': 0.15, 'MID': 0.08, 'DEF': 0.03, 'GKP': 0.0}
+
+# Seasons to pull from vaastav — weighted so recent matters more
+HISTORICAL_SEASONS = {
+    '2021-22': 0.5,
+    '2022-23': 0.7,
+    '2023-24': 1.0,
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FETCHING
+# FETCHING — FPL
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_bootstrap():
@@ -97,77 +110,216 @@ def fetch_all_histories(eligible_ids):
     bar.empty()
     return pd.concat(all_history, ignore_index=True)
 
-def fetch_chips(tid):
+# ─────────────────────────────────────────────────────────────────────────────
+# FETCHING — Historical data from vaastav's GitHub repo
+# 3 past seasons used for training only — predictions still use current season
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_historical_data():
+    base = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
+    all_dfs = []
+    for season, weight in HISTORICAL_SEASONS.items():
+        url = f"{base}/{season}/gws/merged_gw.csv"
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code != 200:
+                continue
+            df = pd.read_csv(StringIO(r.text))
+
+            # Normalise column names
+            df.columns = [c.strip().lower() for c in df.columns]
+            if 'gw' in df.columns and 'round' not in df.columns:
+                df = df.rename(columns={'gw': 'round'})
+
+            # String player_id — name is enough for groupby rolling
+            df['player_id'] = df['name'].astype(str) + '_hist'
+            df['season_weight'] = weight
+
+            # Ensure numeric
+            num_cols = ['total_points', 'minutes', 'goals_scored', 'assists',
+                        'clean_sheets', 'bonus', 'expected_goals', 'expected_assists',
+                        'expected_goal_involvements', 'was_home', 'value',
+                        'team_h_score', 'team_a_score', 'round']
+            for col in num_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+                else:
+                    df[col] = 0.0
+
+            # Normalise position labels
+            if 'position' not in df.columns and 'element_type' in df.columns:
+                df['position'] = df['element_type'].map(POS_MAP)
+
+            all_dfs.append(df)
+        except Exception:
+            continue
+
+    if not all_dfs:
+        return pd.DataFrame()
+    return pd.concat(all_dfs, ignore_index=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ODDS
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_odds(api_key):
+    if not api_key or not api_key.strip():
+        return {}, {}
     try:
-        r = requests.get(f"{API}/entry/{tid}/history/", headers=HEADERS)
-        if r.status_code == 200:
-            return r.json().get('chips', [])
-        return []
-    except:
-        return []
+        events_r = requests.get(
+            "https://api.the-odds-api.com/v4/sports/soccer_epl/events",
+            params={'apiKey': api_key}, timeout=10)
+        if events_r.status_code != 200:
+            return {}, {}
+        events = events_r.json()
 
-def get_remaining_chips(chips_played):
-    names_used = [c['name'] for c in chips_played]
-    wc_used    = names_used.count('wildcard')
-    remaining  = []
-    if wc_used < 2:              remaining.append('wildcard')
-    if 'bboost'  not in names_used: remaining.append('bboost')
-    if 'freehit' not in names_used: remaining.append('freehit')
-    if '3xc'     not in names_used: remaining.append('3xc')
-    return remaining
+        scorer_probs, cs_probs = {}, {}
+        for event in events[:10]:
+            event_id  = event['id']
+            home_team = event.get('home_team', '').lower()
+            away_team = event.get('away_team', '').lower()
+
+            props_r = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/soccer_epl/events/{event_id}/odds",
+                params={'apiKey': api_key, 'regions': 'uk,eu',
+                        'markets': 'player_goal_scorer_anytime',
+                        'oddsFormat': 'decimal'}, timeout=10)
+            if props_r.status_code == 200:
+                player_odds = {}
+                for bk in props_r.json().get('bookmakers', []):
+                    for mk in bk.get('markets', []):
+                        if mk['key'] == 'player_goal_scorer_anytime':
+                            for o in mk.get('outcomes', []):
+                                player_odds.setdefault(o['name'].lower().strip(), []).append(float(o['price']))
+                for player, odds_list in player_odds.items():
+                    scorer_probs[player] = round((1 / np.mean(odds_list)) * 0.94, 4)
+
+            totals_r = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/soccer_epl/events/{event_id}/odds",
+                params={'apiKey': api_key, 'regions': 'uk,eu',
+                        'markets': 'totals', 'oddsFormat': 'decimal'}, timeout=10)
+            if totals_r.status_code == 200:
+                under_05 = []
+                for bk in totals_r.json().get('bookmakers', []):
+                    for mk in bk.get('markets', []):
+                        if mk['key'] == 'totals':
+                            for o in mk.get('outcomes', []):
+                                if o['name'] == 'Under' and float(o.get('point', 99)) <= 0.5:
+                                    under_05.append(float(o['price']))
+                if under_05:
+                    both_cs = (1 / np.mean(under_05)) * 0.94
+                    cs_probs[home_team] = round(both_cs ** 0.5, 4)
+                    cs_probs[away_team] = round(both_cs ** 0.5, 4)
+
+        return scorer_probs, cs_probs
+    except Exception:
+        return {}, {}
+
+def match_odds_names(fpl_names, odds_names):
+    mapping  = {}
+    odds_low = [n.lower() for n in odds_names]
+    for name in fpl_names:
+        matches = get_close_matches(name.lower(), odds_low, n=1, cutoff=0.6)
+        if matches:
+            mapping[name] = matches[0]
+        else:
+            for on in odds_low:
+                if name.lower() in on.split():
+                    mapping[name] = on
+                    break
+    return mapping
+
+def apply_odds_multiplier(xp, pos, player_name, scorer_probs, cs_probs,
+                           team_name, odds_name_map):
+    multiplier = 1.0
+    if pos in ['FWD', 'MID']:
+        baseline = BASELINE_GOAL_PROB.get(pos, 0.1)
+        odds_key = odds_name_map.get(player_name)
+        if odds_key and odds_key in scorer_probs and baseline > 0:
+            multiplier = float(np.clip(scorer_probs[odds_key] / baseline, 0.75, 1.35))
+    elif pos in ['DEF', 'GKP']:
+        team_key = team_name.lower() if team_name else ''
+        if team_key not in cs_probs:
+            m = get_close_matches(team_key, list(cs_probs.keys()), n=1, cutoff=0.5)
+            team_key = m[0] if m else ''
+        if team_key in cs_probs:
+            multiplier = float(np.clip(cs_probs[team_key] / 0.28, 0.75, 1.35))
+    return round(xp * multiplier, 2), round(multiplier, 3)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FEATURES — original logic preserved exactly, opp_gc_rolling5 included
+# FEATURES — single function handles both current and historical data
+# fpl_teams=None → use neutral opponent values (for historical seasons)
 # ─────────────────────────────────────────────────────────────────────────────
-def build_features(history_df, fpl_teams):
-    df = history_df.copy().sort_values(['player_id', 'round'])
+def build_features(df, fpl_teams=None):
+    df = df.copy().sort_values(['player_id', 'round'])
 
-    # Rolling averages — same columns as original
+    roll_cols = [
+        ('total_points',               'pts'),
+        ('expected_goals',             'xg'),
+        ('expected_assists',           'xa'),
+        ('expected_goal_involvements', 'xgi'),
+        ('minutes',                    'mins'),
+        ('bonus',                      'bonus'),
+        ('goals_scored',               'goals'),
+        ('assists',                    'assists'),
+    ]
     for window in [3, 5, 10]:
-        for col, feat in [
-            ('total_points',               'pts'),
-            ('expected_goals',             'xg'),
-            ('expected_assists',           'xa'),
-            ('expected_goal_involvements', 'xgi'),
-            ('minutes',                    'mins'),
-            ('bonus',                      'bonus'),
-        ]:
+        for col, feat in roll_cols:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
                 df[f'{feat}_avg_{window}'] = df.groupby('player_id')[col].transform(
                     lambda x: x.shift(1).rolling(window, min_periods=1).mean()
                 )
+            else:
+                df[f'{feat}_avg_{window}'] = 0.0
 
+    # Home / away split — key signal for players with strong venue bias
+    df['_pts_home'] = df['total_points'].where(df['was_home'].astype(bool), np.nan)
+    df['_pts_away'] = df['total_points'].where(~df['was_home'].astype(bool), np.nan)
+    df['pts_home_avg5'] = df.groupby('player_id')['_pts_home'].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+    df['pts_away_avg5'] = df.groupby('player_id')['_pts_away'].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+    # Fill NaN (player only played home/away recently) with overall avg
+    df['pts_home_avg5'] = df['pts_home_avg5'].fillna(df['pts_avg_5'])
+    df['pts_away_avg5'] = df['pts_away_avg5'].fillna(df['pts_avg_5'])
+    df.drop(columns=['_pts_home', '_pts_away'], inplace=True)
+
+    # Minutes trend — positive = getting more minutes (nailed), negative = rotation risk
     df['minutes_ratio'] = (df['mins_avg_5'] / 90).clip(0, 1)
+    df['mins_trend']    = (df['mins_avg_3'] - df['mins_avg_10']).fillna(0)
     df['is_home']       = df['was_home'].astype(int)
 
-    # Team strength normalisation
-    ts = fpl_teams.set_index('id')[[
-        'strength_attack_home', 'strength_attack_away',
-        'strength_defence_home', 'strength_defence_away'
-    ]]
-    df['opp_attack_strength'] = df.apply(
-        lambda r: ts.loc[r['opponent_team'], 'strength_attack_home']
-        if not r['was_home'] and r['opponent_team'] in ts.index
-        else ts.loc[r['opponent_team'], 'strength_attack_away']
-        if r['opponent_team'] in ts.index else np.nan, axis=1)
-    df['opp_defence_strength'] = df.apply(
-        lambda r: ts.loc[r['opponent_team'], 'strength_defence_home']
-        if r['was_home'] and r['opponent_team'] in ts.index
-        else ts.loc[r['opponent_team'], 'strength_defence_away']
-        if r['opponent_team'] in ts.index else np.nan, axis=1)
-    for col, norm in [('opp_attack_strength',  'opp_attack_norm'),
-                      ('opp_defence_strength', 'opp_defence_norm')]:
-        mn, mx = df[col].min(), df[col].max()
-        df[norm] = (df[col] - mn) / (mx - mn + 1e-9)
+    # Opponent strength — full computation if fpl_teams provided
+    if fpl_teams is not None:
+        ts = fpl_teams.set_index('id')[[
+            'strength_attack_home', 'strength_attack_away',
+            'strength_defence_home', 'strength_defence_away'
+        ]]
+        df['opp_attack_strength'] = df.apply(
+            lambda r: ts.loc[r['opponent_team'], 'strength_attack_home']
+            if not r['was_home'] and r['opponent_team'] in ts.index
+            else ts.loc[r['opponent_team'], 'strength_attack_away']
+            if r['opponent_team'] in ts.index else np.nan, axis=1)
+        df['opp_defence_strength'] = df.apply(
+            lambda r: ts.loc[r['opponent_team'], 'strength_defence_home']
+            if r['was_home'] and r['opponent_team'] in ts.index
+            else ts.loc[r['opponent_team'], 'strength_defence_away']
+            if r['opponent_team'] in ts.index else np.nan, axis=1)
+        for col, norm in [('opp_attack_strength', 'opp_attack_norm'),
+                          ('opp_defence_strength', 'opp_defence_norm')]:
+            mn, mx = df[col].min(), df[col].max()
+            df[norm] = (df[col] - mn) / (mx - mn + 1e-9)
+    else:
+        # Historical data — no team strength available, use neutral
+        df['opp_attack_norm']  = 0.5
+        df['opp_defence_norm'] = 0.5
+        df['opp_attack_strength']  = np.nan
+        df['opp_defence_strength'] = np.nan
 
-    # Opponent goals-conceded rolling — strong signal for attacking picks
-    score_col = None
-    for c in ['team_h_score', 'team_a_score']:
-        if c in df.columns:
-            score_col = c
-            break
-    if score_col:
+    # Opponent GC rolling — computable from score columns in both current + historical
+    score_col = next((c for c in ['team_h_score', 'team_a_score'] if c in df.columns), None)
+    if score_col and 'opponent_team' in df.columns:
         team_gc = df.groupby(['opponent_team', 'round'])[score_col].mean().reset_index()
         team_gc.columns = ['_tid', 'round', 'gsa']
         team_gc['opp_gc_rolling5'] = team_gc.groupby('_tid')['gsa'].transform(
@@ -175,46 +327,81 @@ def build_features(history_df, fpl_teams):
         df = df.merge(team_gc[['_tid', 'round', 'opp_gc_rolling5']],
                       left_on=['opponent_team', 'round'],
                       right_on=['_tid', 'round'], how='left').drop(columns='_tid')
+        df['opp_gc_rolling5'] = df['opp_gc_rolling5'].fillna(0.5)
     else:
-        df['opp_gc_rolling5'] = 0.0
+        df['opp_gc_rolling5'] = 0.5
 
-    df['price_norm']   = (df['value'] / 10 - 3.5) / (15 - 3.5)
+    df['price_norm']   = ((df['value'] / 10) - 3.5) / (15 - 3.5) if 'value' in df.columns else 0.5
     df['cs_rolling5']  = df.groupby('player_id')['clean_sheets'].transform(
-        lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+    ).fillna(0) if 'clean_sheets' in df.columns else 0.0
     df['volatility_5'] = df.groupby('player_id')['total_points'].transform(
         lambda x: x.shift(1).rolling(5, min_periods=3).std())
-    df['goals_avg_5']  = df.groupby('player_id')['goals_scored'].transform(
-        lambda x: x.shift(1).rolling(5, min_periods=1).mean()) if 'goals_scored' in df.columns else 0.0
+    df['goals_avg_5']  = df['goals_avg_5']  if 'goals_avg_5'  in df.columns else 0.0
 
     df['target'] = df['total_points']
     return df
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODEL — position-aware (from latest) but same hyperparams as original
+# MODEL — trains on current + historical combined, weighted by season recency
 # ─────────────────────────────────────────────────────────────────────────────
-def train_position_models(df):
+def train_position_models(current_features, historical_features=None):
     models, maes = {}, {}
+
     for pos in ['GKP', 'DEF', 'MID', 'FWD']:
-        pos_df = df[df['position'] == pos].dropna(
-            subset=FEATURE_COLS + ['target']).sort_values('round')
-        if len(pos_df) < 50:
+        # Current season data
+        curr = current_features[current_features['position'] == pos].dropna(
+            subset=FEATURE_COLS + ['target']).sort_values('round').copy()
+        curr['sample_weight'] = 1.5  # current season weighted highest
+
+        frames = [curr]
+
+        # Historical data for this position
+        if historical_features is not None and not historical_features.empty:
+            hist_pos = historical_features[
+                historical_features['position'] == pos
+            ].dropna(subset=FEATURE_COLS + ['target']).copy()
+            if not hist_pos.empty:
+                hist_pos['sample_weight'] = hist_pos.get('season_weight', 0.7)
+                frames.append(hist_pos)
+
+        combined = pd.concat(frames, ignore_index=True)
+        if len(combined) < 100:
             continue
-        split_gw = int(pos_df['round'].quantile(0.8))
-        train    = pos_df[pos_df['round'] < split_gw]
-        test     = pos_df[pos_df['round'] >= split_gw]
-        # Same hyperparams as original — don't over-engineer
+
+        # Time-based split on current season only for evaluation
+        split_gw = int(curr['round'].quantile(0.8))
+        train    = combined[~((combined['round'] >= split_gw) &
+                               (combined['sample_weight'] == 1.5))]
+        test     = curr[curr['round'] >= split_gw]
+
+        if len(train) < 50 or len(test) < 10:
+            continue
+
         model = XGBRegressor(
             n_estimators=400, max_depth=4, learning_rate=0.04,
             subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
             random_state=42, verbosity=0
         )
-        model.fit(train[FEATURE_COLS].fillna(0), train['target'],
-                  eval_set=[(test[FEATURE_COLS].fillna(0), test['target'])],
-                  verbose=False)
+        model.fit(
+            train[FEATURE_COLS].fillna(0), train['target'],
+            sample_weight=train['sample_weight'],
+            eval_set=[(test[FEATURE_COLS].fillna(0), test['target'])],
+            verbose=False
+        )
         preds       = model.predict(test[FEATURE_COLS].fillna(0))
         models[pos] = model
         maes[pos]   = round(mean_absolute_error(test['target'], preds), 3)
+
     return models, maes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FORM MULTIPLIER
+# ─────────────────────────────────────────────────────────────────────────────
+def apply_form_multiplier(xp, pts_avg_3, pts_avg_10):
+    if pd.isna(pts_avg_3) or pd.isna(pts_avg_10) or pts_avg_10 < 0.5:
+        return xp
+    return round(xp * float(np.clip(pts_avg_3 / pts_avg_10, 0.6, 1.4)), 2)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PREDICTIONS
@@ -241,10 +428,14 @@ def predict_for_gw(player_row, fix, model, fpl_teams, all_att, all_def):
         raw_def = opp['strength_defence_home'] if fix['is_home']     else opp['strength_defence_away']
         feat['opp_attack_norm']  = (raw_att - all_att.min()) / (all_att.max() - all_att.min() + 1e-9)
         feat['opp_defence_norm'] = (raw_def - all_def.min()) / (all_def.max() - all_def.min() + 1e-9)
-    feat_df = pd.DataFrame([feat])[FEATURE_COLS].fillna(0)
-    return max(0, round(float(model.predict(feat_df)[0]), 2))
+        # Override home/away pts with correct context
+        feat['pts_home_avg5'] = player_row.get('pts_home_avg5', player_row.get('pts_avg_5', 0))
+        feat['pts_away_avg5'] = player_row.get('pts_away_avg5', player_row.get('pts_avg_5', 0))
+    return max(0, round(float(model.predict(
+        pd.DataFrame([feat])[FEATURE_COLS].fillna(0))[0]), 2))
 
-def predict_next_gw(features_df, models, fpl_players, fpl_teams, fixtures, n_gws=3):
+def predict_next_gw(features_df, models, fpl_players, fpl_teams, fixtures,
+                    scorer_probs, cs_probs, n_gws=3):
     future    = fixtures[fixtures['finished'] == False].copy()
     next_gw   = int(future['event'].dropna().min())
     ts        = fpl_teams.set_index('id')
@@ -253,17 +444,21 @@ def predict_next_gw(features_df, models, fpl_players, fpl_teams, fixtures, n_gws
     latest    = features_df.sort_values('round').groupby('player_id').last().reset_index()
     gws_ahead = sorted(future['event'].dropna().unique())[:n_gws]
 
+    fpl_web_names = fpl_players['web_name'].tolist()
+    odds_name_map = match_odds_names(fpl_web_names, list(scorer_probs.keys())) \
+                    if scorer_probs else {}
+    odds_available = bool(scorer_probs or cs_probs)
+
     def get_next_5(team_id):
         home = future[future['team_h'] == team_id][['event', 'team_a', 'team_h_difficulty']].copy()
         home.columns = ['event', 'opponent', 'difficulty']; home['is_home'] = True
         away = future[future['team_a'] == team_id][['event', 'team_h', 'team_a_difficulty']].copy()
         away.columns = ['event', 'opponent', 'difficulty']; away['is_home'] = False
         all_f = pd.concat([home, away]).sort_values('event').head(5)
-        out = []
-        for _, r in all_f.iterrows():
-            opp = ts.loc[r['opponent'], 'short_name'] if r['opponent'] in ts.index else '?'
-            out.append(f"{'H' if r['is_home'] else 'A'} {opp}[{int(r['difficulty'])}]")
-        return ' | '.join(out)
+        return ' | '.join(
+            f"{'H' if r['is_home'] else 'A'} {ts.loc[r['opponent'],'short_name'] if r['opponent'] in ts.index else '?'}[{int(r['difficulty'])}]"
+            for _, r in all_f.iterrows()
+        )
 
     rows = []
     for _, player in latest.iterrows():
@@ -273,46 +468,81 @@ def predict_next_gw(features_df, models, fpl_players, fpl_teams, fixtures, n_gws
         fpl_row = fpl_players[fpl_players['id'] == pid]
         if fpl_row.empty:
             continue
-        fpl_row = fpl_row.iloc[0]
-        team_id = int(fpl_row['team'])
+        fpl_row   = fpl_row.iloc[0]
+        team_id   = int(fpl_row['team'])
+        web_name  = fpl_row['web_name']
+        team_name = fpl_row.get('team_name', '')
 
         fix1 = get_fixture_for_gw(team_id, next_gw, future)
         if fix1 is None:
             continue
-        xp1 = predict_for_gw(player, fix1, models[pos], fpl_teams, all_att, all_def)
 
-        # Multi-GW average
+        # 1. Model prediction
+        raw_xp = predict_for_gw(player, fix1, models[pos], fpl_teams, all_att, all_def)
+
+        # 2. Form multiplier
+        pts_avg_3  = player.get('pts_avg_3',  np.nan)
+        pts_avg_10 = player.get('pts_avg_10', np.nan)
+        xp_form    = apply_form_multiplier(raw_xp, pts_avg_3, pts_avg_10)
+
+        # 3. Odds multiplier
+        if odds_available:
+            xp1, odds_mult = apply_odds_multiplier(
+                xp_form, pos, web_name, scorer_probs, cs_probs, team_name, odds_name_map)
+        else:
+            xp1, odds_mult = xp_form, 1.0
+
+        # Multi-GW
         multi_xps = []
         for gw in gws_ahead:
             fix = get_fixture_for_gw(team_id, gw, future)
             if fix:
-                multi_xps.append(predict_for_gw(player, fix, models[pos], fpl_teams, all_att, all_def))
+                r   = predict_for_gw(player, fix, models[pos], fpl_teams, all_att, all_def)
+                frm = apply_form_multiplier(r, pts_avg_3, pts_avg_10)
+                if odds_available:
+                    fin, _ = apply_odds_multiplier(frm, pos, web_name, scorer_probs,
+                                                   cs_probs, team_name, odds_name_map)
+                else:
+                    fin = frm
+                multi_xps.append(fin)
         multi_xp_avg = round(np.mean(multi_xps), 2) if multi_xps else xp1
 
         vol        = player.get('volatility_5', 0)
         vol        = 0 if pd.isna(vol) else round(float(vol), 2)
         goals_avg5 = player.get('goals_avg_5',  0)
         goals_avg5 = 0 if pd.isna(goals_avg5) else float(goals_avg5)
+        mins_trend = player.get('mins_trend',   0)
+        mins_trend = 0 if pd.isna(mins_trend) else float(mins_trend)
 
         opp_id     = fix1['opponent']
         opp_short  = ts.loc[opp_id, 'short_name'] if opp_id in ts.index else '?'
         difficulty = fix1['difficulty']
         diff_mult  = DIFF_MULT.get(difficulty, 1.0)
 
-        # Captain score: original formula (xP + 0.3*vol) × difficulty multiplier
-        # GKP never captain; DEF only if regular scorer
         is_def_scorer = (pos == 'DEF' and goals_avg5 >= 0.15)
         if pos in ['MID', 'FWD'] or is_def_scorer:
-            cap_score = round((xp1 + 0.3 * vol) * diff_mult, 2)
-            cap_score = max(0, cap_score)
+            cap_score = max(0, round((xp1 + 0.3 * vol) * diff_mult, 2))
         else:
             cap_score = 0.0
 
+        # Form tag
+        if not pd.isna(pts_avg_3) and not pd.isna(pts_avg_10) and pts_avg_10 >= 0.5:
+            ratio    = pts_avg_3 / pts_avg_10
+            form_tag = '🔥' if ratio >= 1.15 else '❄️' if ratio <= 0.75 else '➡️'
+        else:
+            form_tag = '➡️'
+
+        # Odds tag
+        odds_tag = '📈' if odds_mult > 1.05 else '📉' if odds_mult < 0.95 else '➖'
+
+        # Minutes tag — rotation risk
+        mins_tag = '⚠️' if mins_trend < -15 else ''
+
         rows.append({
             'player_id':     pid,
-            'player':        fpl_row['web_name'],
+            'player':        web_name,
             'position':      pos,
-            'team':          fpl_row.get('team_name', ''),
+            'team':          team_name,
             'price':         fpl_row['now_cost'] / 10,
             'status':        fpl_row['status'],
             'news':          fpl_row.get('news', ''),
@@ -324,6 +554,12 @@ def predict_next_gw(features_df, models, fpl_players, fpl_teams, fixtures, n_gws
             'xP_multi':      multi_xp_avg,
             'volatility':    vol,
             'captain_score': cap_score,
+            'form_tag':      form_tag,
+            'odds_tag':      odds_tag,
+            'mins_tag':      mins_tag,
+            'odds_mult':     odds_mult,
+            'pts_avg_3':     round(float(pts_avg_3),  2) if not pd.isna(pts_avg_3)  else 0,
+            'pts_avg_10':    round(float(pts_avg_10), 2) if not pd.isna(pts_avg_10) else 0,
             'next_5':        get_next_5(team_id),
             'total_points':  fpl_row.get('total_points', 0),
             'ppg':           float(fpl_row.get('points_per_game', 0)),
@@ -338,7 +574,7 @@ def optimize_squad(predictions_df, budget=100.0, existing_squad_ids=None,
     df = predictions_df[predictions_df['status'] == 'a'].dropna(subset=['xP']).copy()
     df['pos_int'] = df['position'].map({'GKP': 1, 'DEF': 2, 'MID': 3, 'FWD': 4})
     xp_col = 'xP_multi' if use_multi_gw and 'xP_multi' in df.columns else 'xP'
-    df = df.set_index('player_id')
+    df   = df.set_index('player_id')
     pids = df.index.tolist()
 
     prob     = pulp.LpProblem("FPL", pulp.LpMaximize)
@@ -349,14 +585,13 @@ def optimize_squad(predictions_df, budget=100.0, existing_squad_ids=None,
     if existing_squad_ids:
         tin = {p: pulp.LpVariable(f"t_{p}", cat="Binary") for p in pids}
 
-    base  = pulp.lpSum(starting[p] * df.loc[p, xp_col]         for p in pids)
-    cap_b = pulp.lpSum(captain[p]  * df.loc[p, 'captain_score'] for p in pids)
+    base  = pulp.lpSum(starting[p] * df.loc[p, xp_col]          for p in pids)
+    cap_b = pulp.lpSum(captain[p]  * df.loc[p, 'captain_score']  for p in pids)
     vc_b  = pulp.lpSum(vice[p]     * df.loc[p, 'captain_score'] * 0.5 for p in pids)
 
     if existing_squad_ids:
         n_tin   = pulp.lpSum(tin[p] for p in pids if p not in existing_squad_ids)
-        penalty = 4 * (n_tin - free_transfers)
-        prob   += base + cap_b + vc_b - penalty
+        prob   += base + cap_b + vc_b - 4 * (n_tin - free_transfers)
     else:
         prob += base + cap_b + vc_b
 
@@ -370,9 +605,6 @@ def optimize_squad(predictions_df, budget=100.0, existing_squad_ids=None,
         prob += vice[p]     <= starting[p]
         prob += starting[p] <= selected[p]
         prob += captain[p] + vice[p] <= 1
-
-    # Only eligible captain candidates (captain_score > 0)
-    for p in pids:
         if df.loc[p, 'captain_score'] == 0:
             prob += captain[p] == 0
             prob += vice[p]    == 0
@@ -393,10 +625,8 @@ def optimize_squad(predictions_df, budget=100.0, existing_squad_ids=None,
 
     if existing_squad_ids:
         for p in pids:
-            if p not in existing_squad_ids:
-                prob += tin[p] >= selected[p]
-            else:
-                prob += tin[p] == 0
+            if p not in existing_squad_ids: prob += tin[p] >= selected[p]
+            else:                           prob += tin[p] == 0
 
     prob.solve(pulp.PULP_CBC_CMD(msg=0))
     if prob.status != 1:
@@ -417,7 +647,6 @@ def optimize_squad(predictions_df, budget=100.0, existing_squad_ids=None,
             'VC' if r['is_vice'] else ('START' if r['is_starting'] else 'BENCH')), axis=1)
 
     n_transfers = int(squad_df['is_transfer_in'].sum()) if existing_squad_ids else 0
-    hits        = max(0, n_transfers - free_transfers) * 4
     return {
         'squad':        squad_df.sort_values(['is_starting', 'pos_int'], ascending=[False, True]),
         'captain':      df.loc[cap_id, 'player'],
@@ -425,13 +654,13 @@ def optimize_squad(predictions_df, budget=100.0, existing_squad_ids=None,
         'total_xP':     round(pulp.value(prob.objective), 2),
         'total_cost':   round(squad_df['price'].sum(), 1),
         'n_transfers':  n_transfers,
-        'hits':         hits,
+        'hits':         max(0, n_transfers - free_transfers) * 4,
     }
 
 def optimize_lineup_from_squad(squad_pred):
     df = squad_pred.copy()
     df['pos_int'] = df['position'].map({'GKP': 1, 'DEF': 2, 'MID': 3, 'FWD': 4})
-    df = df.set_index('player_id')
+    df   = df.set_index('player_id')
     pids = df.index.tolist()
 
     prob     = pulp.LpProblem("Lineup", pulp.LpMaximize)
@@ -439,10 +668,9 @@ def optimize_lineup_from_squad(squad_pred):
     captain  = {p: pulp.LpVariable(f"c_{p}", cat="Binary") for p in pids}
     vice     = {p: pulp.LpVariable(f"v_{p}", cat="Binary") for p in pids}
 
-    base  = pulp.lpSum(starting[p] * df.loc[p, 'xP']           for p in pids)
-    cap_b = pulp.lpSum(captain[p]  * df.loc[p, 'captain_score'] for p in pids)
-    vc_b  = pulp.lpSum(vice[p]     * df.loc[p, 'captain_score'] * 0.5 for p in pids)
-    prob += base + cap_b + vc_b
+    prob += (pulp.lpSum(starting[p] * df.loc[p, 'xP']           for p in pids) +
+             pulp.lpSum(captain[p]  * df.loc[p, 'captain_score'] for p in pids) +
+             pulp.lpSum(vice[p]     * df.loc[p, 'captain_score'] * 0.5 for p in pids))
 
     prob += pulp.lpSum(starting.values()) == 11
     prob += pulp.lpSum(captain.values())  == 1
@@ -452,8 +680,6 @@ def optimize_lineup_from_squad(squad_pred):
         prob += captain[p] <= starting[p]
         prob += vice[p]    <= starting[p]
         prob += captain[p] + vice[p] <= 1
-
-    for p in pids:
         if df.loc[p, 'captain_score'] == 0:
             prob += captain[p] == 0
             prob += vice[p]    == 0
@@ -484,19 +710,13 @@ def analyse_weaknesses(my_pred, available):
     issues     = []
     league_avg = available.groupby('position')['xP'].mean().to_dict()
     for pos in ['GKP', 'DEF', 'MID', 'FWD']:
-        pos_players = my_pred[my_pred['position'] == pos].sort_values('xP')
-        avg         = league_avg.get(pos, 0)
-        for _, p in pos_players.iterrows():
+        avg = league_avg.get(pos, 0)
+        for _, p in my_pred[my_pred['position'] == pos].sort_values('xP').iterrows():
             if p['xP'] < avg * 0.75:
-                issues.append({
-                    'player':   p['player'],
-                    'position': pos,
-                    'xP':       p['xP'],
-                    'team_avg': round(avg, 2),
-                    'gap':      round(avg - p['xP'], 2),
-                    'status':   p['status'],
-                    'news':     p['news'],
-                })
+                issues.append({'player': p['player'], 'position': pos,
+                                'xP': p['xP'], 'team_avg': round(avg, 2),
+                                'gap': round(avg - p['xP'], 2),
+                                'status': p['status'], 'news': p['news']})
     return sorted(issues, key=lambda x: x['gap'], reverse=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -521,9 +741,7 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     team_id_input = st.text_input("FPL Team ID", placeholder="e.g. 1234567")
     bank, free_trs, team_info, my_squad_ids = None, None, None, None
-    remaining_chips = []
-    chips_played    = []
-    budget_input    = 100.0
+    budget_input = 100.0
 
     if team_id_input.strip():
         try:
@@ -545,34 +763,11 @@ with st.sidebar:
                     st.markdown(f"**{team_info.get('name', '')}**")
                     st.markdown(f"<span class='muted'>Rank</span> **{team_info.get('summary_overall_rank','?'):,}**", unsafe_allow_html=True)
                     st.markdown(f"<span class='muted'>Points</span> **{team_info.get('summary_overall_points','?')}**", unsafe_allow_html=True)
-                col1, col2 = st.columns(2)
-                col1.metric("Squad Value", f"£{round(squad_value,1)}m")
-                col2.metric("Bank",        f"£{round(bank,1)}m")
-                col1.metric("Budget",      f"£{budget_input}m")
-                col2.metric("Free Xfers",  free_trs)
-
-                chips_played    = fetch_chips(tid)
-                remaining_chips = get_remaining_chips(chips_played)
-                wc_used_count   = sum(1 for c in chips_played if c['name'] == 'wildcard')
-
-                st.markdown("**Chips**")
-                for k in remaining_chips:
-                    name, note = ALL_CHIPS[k]
-                    if k == 'wildcard':
-                        note = f"{2 - wc_used_count} remaining"
-                    st.markdown(
-                        f"<div style='margin:3px 0'><span class='good'>✅ {name}</span> "
-                        f"<span class='muted'>({note})</span></div>",
-                        unsafe_allow_html=True)
-                for c in chips_played:
-                    label = ALL_CHIPS.get(c['name'], (c['name'], ''))[0]
-                    st.markdown(
-                        f"<span class='muted'>❌ {label} used GW{c.get('event','?')}</span>",
-                        unsafe_allow_html=True)
-
-                st.session_state['remaining_chips'] = remaining_chips
-                st.session_state['chips_played']    = chips_played
-
+                c1, c2 = st.columns(2)
+                c1.metric("Squad Value", f"£{round(squad_value,1)}m")
+                c2.metric("Bank",        f"£{round(bank,1)}m")
+                c1.metric("Budget",      f"£{budget_input}m")
+                c2.metric("Free Xfers",  free_trs)
         except Exception as e:
             st.warning(f"Could not load team: {e}")
 
@@ -582,11 +777,24 @@ with st.sidebar:
             "Budget (£m)", min_value=85.0, max_value=104.0, value=100.0, step=0.1)
 
     st.divider()
+    st.markdown("**Odds API**")
+    st.caption("Free key at the-odds-api.com")
+    odds_api_key = st.text_input("API Key (optional)", type="password", placeholder="Paste key here")
+
+    st.divider()
+    st.markdown("**Chips Available**")
+    st.caption("Tick what you still have")
+    selected_chips = []
+    if st.checkbox("Wildcard",       key="chip_wc"): selected_chips.append('wildcard')
+    if st.checkbox("Bench Boost",    key="chip_bb"): selected_chips.append('bboost')
+    if st.checkbox("Free Hit",       key="chip_fh"): selected_chips.append('freehit')
+    if st.checkbox("Triple Captain", key="chip_tc"): selected_chips.append('3xc')
+
+    st.divider()
     use_multi_gw = st.checkbox("Optimise for next 3 GWs", value=False)
 
     if st.button("🚀 Run Model", type="primary", use_container_width=True):
-        for k in ['predictions', 'result', 'maes', 'next_gw', 'pipeline_key',
-                  'scenarios', 'scenario_key']:
+        for k in ['predictions', 'result', 'maes', 'next_gw', 'pipeline_key']:
             st.session_state.pop(k, None)
         st.session_state['model_run'] = True
 
@@ -608,15 +816,38 @@ for col in ['total_points', 'minutes', 'expected_goals', 'expected_assists',
         history_df[col] = pd.to_numeric(history_df[col], errors='coerce')
 history_df = history_df.merge(meta, on='player_id', how='left')
 
-cache_key = f"{next_gw}_{budget_input}_{use_multi_gw}"
+# Odds
+scorer_probs, cs_probs = {}, {}
+if odds_api_key.strip():
+    with st.spinner("Fetching market odds..."):
+        scorer_probs, cs_probs = fetch_odds(odds_api_key.strip())
+    if scorer_probs:
+        st.sidebar.success(f"✅ Odds loaded — {len(scorer_probs)} players")
+    else:
+        st.sidebar.warning("⚠️ Odds unavailable — check key")
+
+hist_features = None  # default in case cache is hit
+cache_key = f"{next_gw}_{budget_input}_{use_multi_gw}_{bool(scorer_probs)}"
 if st.session_state.get('pipeline_key') != cache_key:
     with st.spinner("Building features..."):
         features_df = build_features(history_df, fpl_teams)
+
+    with st.spinner("Loading historical training data..."):
+        hist_raw = fetch_historical_data()
+        if not hist_raw.empty:
+            hist_features = build_features(hist_raw, fpl_teams=None)
+        else:
+            hist_features = None
+            st.sidebar.caption("⚠️ Historical data unavailable — training on current season only")
+
     with st.spinner("Training models..."):
-        models, maes = train_position_models(features_df)
+        models, maes = train_position_models(features_df, hist_features)
+
     with st.spinner("Generating predictions..."):
         predictions, next_gw = predict_next_gw(
-            features_df, models, fpl_players, fpl_teams, fixtures, n_gws=3)
+            features_df, models, fpl_players, fpl_teams, fixtures,
+            scorer_probs, cs_probs, n_gws=3)
+
     with st.spinner("Optimizing squad..."):
         result = optimize_squad(predictions, budget=budget_input,
                                 existing_squad_ids=my_squad_ids,
@@ -635,9 +866,7 @@ else:
     maes        = st.session_state['maes']
     next_gw     = st.session_state['next_gw']
 
-available       = predictions[predictions['status'] == 'a'].copy()
-remaining_chips = st.session_state.get('remaining_chips', [])
-chips_played    = st.session_state.get('chips_played', [])
+available = predictions[predictions['status'] == 'a'].copy()
 
 # ── Header ────────────────────────────────────────────────────────────────────
 if team_info:
@@ -650,6 +879,8 @@ if team_info:
 else:
     st.markdown(f"<h3>GW{next_gw} Predictions</h3>", unsafe_allow_html=True)
 
+st.caption(f"{'✅ Odds active' if scorer_probs else '➖ No odds'} | "
+           f"{'✅ Historical data loaded' if hist_features is not None and not hist_features.empty else '➖ Current season only'}")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("MAE GKP", maes.get('GKP'))
 c2.metric("MAE DEF", maes.get('DEF'))
@@ -663,33 +894,39 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "🗓️ Fixtures", "🃏 Chips"
 ])
 
-# ── Tab 1: Predictions ────────────────────────────────────────────────────────
+# ── Tab 1 ─────────────────────────────────────────────────────────────────────
 with tab1:
     st.markdown(f"#### GW{next_gw} xP Predictions")
+    st.caption("🔥 in form  ❄️ out of form  ➡️ consistent  |  📈 market boosted  📉 market dampened  |  ⚠️ minutes concern")
     c1, c2, c3 = st.columns([1, 1, 2])
     pos_filter  = c1.selectbox("Position", ["ALL", "GKP", "DEF", "MID", "FWD"], key="pred_pos")
-    sort_filter = c2.selectbox("Sort by",  ["xP", "xP_multi", "captain_score", "price", "ownership", "form"], key="pred_sort")
+    sort_filter = c2.selectbox("Sort by",  ["xP", "xP_multi", "captain_score", "price", "ownership"], key="pred_sort")
     search      = c3.text_input("Search player", "", key="pred_search")
     disp = available.copy()
     if pos_filter != "ALL": disp = disp[disp['position'] == pos_filter]
     if search: disp = disp[disp['player'].str.lower().str.contains(search.lower())]
     disp = disp.sort_values(sort_filter, ascending=False).head(100)
     st.dataframe(
-        disp[['player', 'position', 'team', 'price', 'opponent', 'xP', 'xP_multi',
-              'captain_score', 'volatility', 'ownership', 'form', 'ppg', 'next_5']].reset_index(drop=True),
+        disp[['form_tag', 'odds_tag', 'mins_tag', 'player', 'position', 'team',
+              'price', 'opponent', 'xP', 'xP_multi', 'captain_score',
+              'pts_avg_3', 'pts_avg_10', 'ownership', 'ppg', 'next_5']].reset_index(drop=True),
         column_config={
+            'form_tag':      st.column_config.TextColumn("Form"),
+            'odds_tag':      st.column_config.TextColumn("Mkt"),
+            'mins_tag':      st.column_config.TextColumn("Min"),
             'price':         st.column_config.NumberColumn("£",            format="£%.1f"),
             'xP':            st.column_config.NumberColumn("xP (next)",    format="%.2f"),
             'xP_multi':      st.column_config.NumberColumn("xP (3GW avg)", format="%.2f"),
             'captain_score': st.column_config.NumberColumn("Cap Score",    format="%.2f"),
-            'volatility':    st.column_config.NumberColumn("Vol",          format="%.2f"),
+            'pts_avg_3':     st.column_config.NumberColumn("Avg 3GW",      format="%.2f"),
+            'pts_avg_10':    st.column_config.NumberColumn("Avg 10GW",     format="%.2f"),
             'ownership':     st.column_config.NumberColumn("Own%",         format="%.1f%%"),
-            'next_5':        st.column_config.TextColumn("Next 5 Fixtures", width=300),
+            'next_5':        st.column_config.TextColumn("Next 5", width=300),
         },
         use_container_width=True, hide_index=True, height=600
     )
 
-# ── Tab 2: My Lineup ──────────────────────────────────────────────────────────
+# ── Tab 2 ─────────────────────────────────────────────────────────────────────
 with tab2:
     st.markdown("#### Recommended Lineup From Your Squad")
     if not my_squad_ids:
@@ -702,31 +939,29 @@ with tab2:
             bench    = lineup[~lineup['is_starting']]
             cap_row  = lineup[lineup['is_captain']]
             vc_row   = lineup[lineup['is_vice']]
-            cap_name = cap_row.iloc[0]['player'] if not cap_row.empty else '?'
-            vc_name  = vc_row.iloc[0]['player']  if not vc_row.empty else '?'
             c1, c2, c3 = st.columns(3)
             c1.metric("Projected xP", round(starters['xP'].sum() + (cap_row.iloc[0]['xP'] if not cap_row.empty else 0), 2))
-            c2.metric("Captain",      cap_name)
-            c3.metric("Vice Captain", vc_name)
+            c2.metric("Captain",      cap_row.iloc[0]['player'] if not cap_row.empty else '?')
+            c3.metric("Vice Captain", vc_row.iloc[0]['player']  if not vc_row.empty else '?')
             st.markdown("**Starting XI**")
             st.dataframe(
-                starters[['player', 'position', 'team', 'price', 'opponent', 'xP', 'role', 'next_5']],
+                starters[['form_tag', 'odds_tag', 'mins_tag', 'player', 'position',
+                           'team', 'price', 'opponent', 'xP', 'role', 'next_5']],
                 column_config={
-                    'price':  st.column_config.NumberColumn("£",  format="£%.1f"),
-                    'xP':     st.column_config.NumberColumn("xP", format="%.2f"),
-                    'next_5': st.column_config.TextColumn("Next 5", width=300),
-                },
-                use_container_width=True, hide_index=True
-            )
+                    'form_tag': st.column_config.TextColumn("Form"),
+                    'odds_tag': st.column_config.TextColumn("Mkt"),
+                    'mins_tag': st.column_config.TextColumn("Min"),
+                    'price':    st.column_config.NumberColumn("£",  format="£%.1f"),
+                    'xP':       st.column_config.NumberColumn("xP", format="%.2f"),
+                    'next_5':   st.column_config.TextColumn("Next 5", width=300),
+                }, use_container_width=True, hide_index=True)
             st.markdown("**Bench**")
             st.dataframe(
                 bench[['player', 'position', 'team', 'price', 'xP', 'role']],
                 column_config={
                     'price': st.column_config.NumberColumn("£",  format="£%.1f"),
                     'xP':    st.column_config.NumberColumn("xP", format="%.2f"),
-                },
-                use_container_width=True, hide_index=True
-            )
+                }, use_container_width=True, hide_index=True)
         else:
             st.error("Could not generate lineup.")
 
@@ -746,77 +981,57 @@ with tab2:
                     f"xP: <b>{issue['xP']}</b> vs avg <b>{issue['team_avg']}</b> "
                     f"<span style='color:{color}'>(-{issue['gap']} | {gap_pct}% below)</span>"
                     + (f"<br><span style='color:#888;font-size:12px'>⚠️ {issue['news']}</span>"
-                       if issue['news'] else "") +
-                    "</div>", unsafe_allow_html=True
-                )
+                       if issue['news'] else "") + "</div>", unsafe_allow_html=True)
 
-# ── Tab 3: Transfers ──────────────────────────────────────────────────────────
+# ── Tab 3 ─────────────────────────────────────────────────────────────────────
 with tab3:
     st.markdown("#### Transfer Planner")
     if not my_squad_ids:
-        st.info("Enter your FPL Team ID to get personalised transfer recommendations.")
+        st.info("Enter your FPL Team ID to get transfer recommendations.")
     else:
         my_pred    = predictions[predictions['player_id'].isin(my_squad_ids)].copy()
         current_xp = my_pred['xP'].sum()
         st.markdown("**Your Current Squad**")
         st.dataframe(
             my_pred.sort_values(['position', 'xP'], ascending=[True, False])
-                   [['player', 'position', 'team', 'price', 'opponent', 'xP', 'xP_multi',
-                     'captain_score', 'ownership', 'status', 'news']],
+                   [['form_tag', 'odds_tag', 'mins_tag', 'player', 'position', 'team',
+                     'price', 'opponent', 'xP', 'xP_multi', 'captain_score',
+                     'ownership', 'status', 'news']],
             column_config={
+                'form_tag': st.column_config.TextColumn("Form"),
+                'odds_tag': st.column_config.TextColumn("Mkt"),
+                'mins_tag': st.column_config.TextColumn("Min"),
                 'price':    st.column_config.NumberColumn("£",            format="£%.1f"),
                 'xP':       st.column_config.NumberColumn("xP (next)",    format="%.2f"),
                 'xP_multi': st.column_config.NumberColumn("xP (3GW avg)", format="%.2f"),
-            },
-            use_container_width=True, hide_index=True
-        )
+            }, use_container_width=True, hide_index=True)
         st.metric("Current Squad xP", round(current_xp, 2))
         st.divider()
 
-        st.markdown(f"**Transfer Scenarios** — Bank: £{round(bank or 0, 1)}m | Free: {free_transfers}")
-        col1, col2, col3 = st.columns(3)
-        max_transfers = col1.slider("Max transfers", 1, 5, 2, key="max_tr_slider")
-        take_hit      = col2.checkbox("Include hits", value=True, key="take_hit_cb")
-        multi_gw_tr   = col3.checkbox("3GW optimise", value=False, key="multi_gw_tr")
-
-        scenario_key = f"sc_{max_transfers}_{take_hit}_{multi_gw_tr}_{budget_input}_{free_transfers}"
-        if st.session_state.get('scenario_key') != scenario_key:
+        st.markdown(f"**Recommended Transfers** — Bank: £{round(bank or 0, 1)}m | Free: {free_transfers}")
+        with st.spinner("Calculating best transfers..."):
             scenarios, seen = [], set()
-            prog = st.progress(0, text="Generating scenarios...")
-            for i, n in enumerate(range(1, max_transfers + 1)):
-                prog.progress((i + 1) / max_transfers, text=f"Testing {n} transfer scenario...")
-                hit = max(0, n - free_transfers) * 4
-                if hit > 0 and not take_hit:
-                    continue
+            for n in range(1, 4):
                 res = optimize_squad(predictions, budget=budget_input,
                                      existing_squad_ids=my_squad_ids,
-                                     free_transfers=n, use_multi_gw=multi_gw_tr)
-                if res is None:
-                    continue
+                                     free_transfers=free_transfers,
+                                     use_multi_gw=use_multi_gw)
+                if res is None: continue
                 new_ids = res['squad']['player_id'].tolist()
                 out_ids = [p for p in my_squad_ids if p not in new_ids]
                 in_ids  = [p for p in new_ids       if p not in my_squad_ids]
-                if not in_ids:
-                    continue
+                if not in_ids: continue
                 key = (frozenset(out_ids), frozenset(in_ids))
-                if key in seen:
-                    continue
+                if key in seen: continue
                 seen.add(key)
                 actual_hit = max(0, len(in_ids) - free_transfers) * 4
                 net_gain   = round(res['total_xP'] - current_xp - actual_hit, 2)
-                scenarios.append({
-                    'n': len(in_ids), 'hit': actual_hit,
-                    'net_gain': net_gain, 'total_xP': res['total_xP'],
-                    'result': res, 'out_ids': out_ids, 'in_ids': in_ids,
-                })
-            prog.empty()
-            st.session_state['scenarios']    = scenarios
-            st.session_state['scenario_key'] = scenario_key
-        else:
-            scenarios = st.session_state.get('scenarios', [])
+                scenarios.append({'n': len(in_ids), 'hit': actual_hit, 'net_gain': net_gain,
+                                   'total_xP': res['total_xP'], 'result': res,
+                                   'out_ids': out_ids, 'in_ids': in_ids})
 
         if not scenarios:
-            st.warning("No beneficial transfers found within budget.")
+            st.success("Your squad is already optimal — no beneficial transfers found.")
         else:
             for s in sorted(scenarios, key=lambda x: x['net_gain'], reverse=True):
                 hit_str  = f"-{s['hit']}pt hit" if s['hit'] > 0 else "Free"
@@ -825,8 +1040,7 @@ with tab3:
                     f"{s['n']} Transfer{'s' if s['n'] > 1 else ''} | {hit_str} | Net xP: {gain_str}",
                     expanded=(s['n'] == 1)):
                     out_players = my_pred[my_pred['player_id'].isin(s['out_ids'])]
-                    in_players  = s['result']['squad'][
-                        s['result']['squad']['player_id'].isin(s['in_ids'])]
+                    in_players  = s['result']['squad'][s['result']['squad']['player_id'].isin(s['in_ids'])]
                     c1, c2 = st.columns(2)
                     with c1:
                         st.markdown("🔴 **SELL**")
@@ -834,7 +1048,8 @@ with tab3:
                             st.markdown(
                                 f"<div style='background:#1a0a0a;border:1px solid #331111;"
                                 f"border-radius:4px;padding:8px 12px;margin:4px 0'>"
-                                f"<b>{r['player']}</b> £{r['price']} | xP <b>{r['xP']}</b>"
+                                f"{r.get('form_tag','➡️')} {r.get('odds_tag','➖')} {r.get('mins_tag','')}"
+                                f" <b>{r['player']}</b> £{r['price']} | xP <b>{r['xP']}</b> | {r['opponent']}"
                                 f"</div>", unsafe_allow_html=True)
                     with c2:
                         st.markdown("🟢 **BUY**")
@@ -842,30 +1057,17 @@ with tab3:
                             st.markdown(
                                 f"<div style='background:#0a1a0a;border:1px solid #113311;"
                                 f"border-radius:4px;padding:8px 12px;margin:4px 0'>"
-                                f"<b>{r['player']}</b> £{r['price']} | "
-                                f"xP <b>{r['xP']}</b> | 3GW <b>{r.get('xP_multi','?')}</b> | "
-                                f"{r['opponent']}"
+                                f"{r.get('form_tag','➡️')} {r.get('odds_tag','➖')} {r.get('mins_tag','')}"
+                                f" <b>{r['player']}</b> £{r['price']} | xP <b>{r['xP']}</b> | "
+                                f"3GW <b>{r.get('xP_multi','?')}</b> | {r['opponent']}"
                                 f"</div>", unsafe_allow_html=True)
                     st.markdown("---")
                     col1, col2, col3 = st.columns(3)
                     col1.metric("New Squad xP", s['total_xP'])
                     col2.metric("Points Hit",   f"-{s['hit']}" if s['hit'] > 0 else "None")
                     col3.metric("Net xP Gain",  gain_str)
-                    if st.checkbox("Show full squad",
-                                   key=f"sq_{s['n']}_{s['hit']}_{s['net_gain']}"):
-                        sq = s['result']['squad']
-                        st.dataframe(
-                            sq[['player', 'position', 'team', 'price', 'xP', 'xP_multi', 'role', 'is_transfer_in']],
-                            column_config={
-                                'price':          st.column_config.NumberColumn("£",            format="£%.1f"),
-                                'xP':             st.column_config.NumberColumn("xP (next)",    format="%.2f"),
-                                'xP_multi':       st.column_config.NumberColumn("xP (3GW avg)", format="%.2f"),
-                                'is_transfer_in': st.column_config.CheckboxColumn("New"),
-                            },
-                            use_container_width=True, hide_index=True
-                        )
 
-# ── Tab 4: Optimal Squad ──────────────────────────────────────────────────────
+# ── Tab 4 ─────────────────────────────────────────────────────────────────────
 with tab4:
     st.markdown("#### Optimal Squad")
     if result:
@@ -879,17 +1081,19 @@ with tab4:
         sq = result['squad']
         st.markdown("**Starting XI**")
         st.dataframe(
-            sq[sq['is_starting']][['player', 'position', 'team', 'price', 'opponent',
-                                   'xP', 'xP_multi', 'role', 'is_transfer_in', 'next_5']],
+            sq[sq['is_starting']][['form_tag', 'odds_tag', 'mins_tag', 'player', 'position',
+                                   'team', 'price', 'opponent', 'xP', 'xP_multi',
+                                   'role', 'is_transfer_in', 'next_5']],
             column_config={
+                'form_tag':       st.column_config.TextColumn("Form"),
+                'odds_tag':       st.column_config.TextColumn("Mkt"),
+                'mins_tag':       st.column_config.TextColumn("Min"),
                 'price':          st.column_config.NumberColumn("£",            format="£%.1f"),
                 'xP':             st.column_config.NumberColumn("xP (next)",    format="%.2f"),
                 'xP_multi':       st.column_config.NumberColumn("xP (3GW avg)", format="%.2f"),
                 'is_transfer_in': st.column_config.CheckboxColumn("Transfer In"),
                 'next_5':         st.column_config.TextColumn("Next 5", width=300),
-            },
-            use_container_width=True, hide_index=True
-        )
+            }, use_container_width=True, hide_index=True)
         st.markdown("**Bench**")
         st.dataframe(
             sq[~sq['is_starting']][['player', 'position', 'team', 'price', 'xP', 'is_transfer_in']],
@@ -897,19 +1101,15 @@ with tab4:
                 'price':          st.column_config.NumberColumn("£",  format="£%.1f"),
                 'xP':             st.column_config.NumberColumn("xP", format="%.2f"),
                 'is_transfer_in': st.column_config.CheckboxColumn("Transfer In"),
-            },
-            use_container_width=True, hide_index=True
-        )
+            }, use_container_width=True, hide_index=True)
     else:
         st.error("Optimizer could not find a valid squad.")
 
-# ── Tab 5: Captain Picks ──────────────────────────────────────────────────────
+# ── Tab 5 ─────────────────────────────────────────────────────────────────────
 with tab5:
     st.markdown(f"#### Captain Picks — GW{next_gw}")
-    st.caption("Score = (xP + 0.3 × volatility) × fixture difficulty multiplier. "
-               "Diff 5 = ×0.20  |  Diff 1 = ×1.40.  GKP excluded; DEF only if regular scorer.")
-    cap_df = available[available['captain_score'] > 0].sort_values(
-        'captain_score', ascending=False).head(15)
+    st.caption("Score = (xP + 0.3 × vol) × fixture difficulty multiplier. xP adjusted for form, odds, home/away bias.")
+    cap_df = available[available['captain_score'] > 0].sort_values('captain_score', ascending=False).head(15)
     for i, (_, r) in enumerate(cap_df.iterrows()):
         medal      = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"{i+1}."
         bg_color   = "#1a1a0a" if i == 0 else "#111"
@@ -918,44 +1118,44 @@ with tab5:
             f"<div style='background:{bg_color};border:1px solid #222;border-radius:6px;"
             f"padding:10px 16px;margin:4px 0'>"
             f"<span style='font-size:18px'>{medal}</span> "
+            f"{r.get('form_tag','➡️')} {r.get('odds_tag','➖')} "
             f"<b>{r['player']}</b> <span style='color:#666'>— {r['team']}</span> | "
             f"xP: <b>{r['xP']}</b> | 3GW: {r.get('xP_multi','?')} | "
             f"vs {r['opponent']} <span style='color:{diff_color}'>[diff {r['difficulty']}]</span> | "
             f"Cap Score: <b>{r['captain_score']}</b>"
-            f"</div>", unsafe_allow_html=True
-        )
+            f"</div>", unsafe_allow_html=True)
 
-# ── Tab 6: Differentials ──────────────────────────────────────────────────────
+# ── Tab 6 ─────────────────────────────────────────────────────────────────────
 with tab6:
     st.markdown("#### Differentials & Value Picks")
     c1, c2 = st.columns(2)
     own_threshold = c1.slider("Max ownership %", 5, 30, 15, key="diff_own")
     min_xp        = c2.slider("Min xP", 2.0, 8.0, 3.5, step=0.5, key="diff_xp")
     diffs = available[
-        (available['ownership'] <= own_threshold) &
-        (available['xP'] >= min_xp)
+        (available['ownership'] <= own_threshold) & (available['xP'] >= min_xp)
     ].sort_values('captain_score', ascending=False)
     st.caption(f"{len(diffs)} differentials found")
     for pos in ['FWD', 'MID', 'DEF', 'GKP']:
         pos_diffs = diffs[diffs['position'] == pos].head(8)
-        if pos_diffs.empty:
-            continue
+        if pos_diffs.empty: continue
         st.markdown(f"**{pos}**")
         st.dataframe(
-            pos_diffs[['player', 'team', 'price', 'opponent', 'xP', 'xP_multi',
-                       'captain_score', 'ownership', 'next_5']].reset_index(drop=True),
+            pos_diffs[['form_tag', 'odds_tag', 'mins_tag', 'player', 'team', 'price',
+                       'opponent', 'xP', 'xP_multi', 'captain_score',
+                       'ownership', 'next_5']].reset_index(drop=True),
             column_config={
+                'form_tag':      st.column_config.TextColumn("Form"),
+                'odds_tag':      st.column_config.TextColumn("Mkt"),
+                'mins_tag':      st.column_config.TextColumn("Min"),
                 'price':         st.column_config.NumberColumn("£",            format="£%.1f"),
                 'xP':            st.column_config.NumberColumn("xP (next)",    format="%.2f"),
                 'xP_multi':      st.column_config.NumberColumn("xP (3GW avg)", format="%.2f"),
                 'captain_score': st.column_config.NumberColumn("Cap Score",    format="%.2f"),
                 'ownership':     st.column_config.NumberColumn("Own%",         format="%.1f%%"),
-                'next_5':        st.column_config.TextColumn("Next 5",         width=300),
-            },
-            use_container_width=True, hide_index=True
-        )
+                'next_5':        st.column_config.TextColumn("Next 5", width=300),
+            }, use_container_width=True, hide_index=True)
 
-# ── Tab 7: Fixtures ───────────────────────────────────────────────────────────
+# ── Tab 7 ─────────────────────────────────────────────────────────────────────
 with tab7:
     st.markdown("#### Fixture Difficulty Planner")
     n_gws     = st.slider("GWs ahead", 3, 8, 5, key="fix_gws")
@@ -964,7 +1164,7 @@ with tab7:
     ts        = fpl_teams.set_index('id')
     fix_rows  = []
     for _, team in fpl_teams.iterrows():
-        row        = {'Team': team['name']}
+        row = {'Team': team['name']}
         total_diff = 0
         for gw in gws_ahead:
             home = future_n[(future_n['team_h'] == team['id']) & (future_n['event'] == gw)]
@@ -973,17 +1173,14 @@ with tab7:
                 r    = home.iloc[0]
                 opp  = ts.loc[r['team_a'], 'short_name'] if r['team_a'] in ts.index else '?'
                 diff = int(r['team_h_difficulty'])
-                row[f'GW{int(gw)}'] = f"{opp}(H)[{diff}]"
-                total_diff += diff
+                row[f'GW{int(gw)}'] = f"{opp}(H)[{diff}]"; total_diff += diff
             elif not away.empty:
                 r    = away.iloc[0]
                 opp  = ts.loc[r['team_h'], 'short_name'] if r['team_h'] in ts.index else '?'
                 diff = int(r['team_a_difficulty'])
-                row[f'GW{int(gw)}'] = f"{opp}(A)[{diff}]"
-                total_diff += diff
+                row[f'GW{int(gw)}'] = f"{opp}(A)[{diff}]"; total_diff += diff
             else:
-                row[f'GW{int(gw)}'] = "BGW"
-                total_diff += 3
+                row[f'GW{int(gw)}'] = "BGW"; total_diff += 3
         row['Avg Diff'] = round(total_diff / n_gws, 1)
         fix_rows.append(row)
     fix_df  = pd.DataFrame(fix_rows).sort_values('Avg Diff')
@@ -998,100 +1195,91 @@ with tab7:
     st.dataframe(fix_df.style.map(color_diff, subset=gw_cols),
                  use_container_width=True, hide_index=True, height=600)
 
-# ── Tab 8: Chips ──────────────────────────────────────────────────────────────
+# ── Tab 8 ─────────────────────────────────────────────────────────────────────
 with tab8:
     st.markdown("#### Chip Strategy")
-    if not my_squad_ids:
-        st.info("Enter your FPL Team ID to see chip recommendations.")
-    elif not remaining_chips:
-        st.success("All chips have been used this season.")
+    if not selected_chips:
+        st.info("Tick the chips you still have in the sidebar to see recommendations.")
     else:
         future_n  = fixtures[fixtures['finished'] == False].copy()
-        gws_list  = sorted(future_n['event'].dropna().unique())[:10]
         gw_scores = []
-        for gw in gws_list:
+        for gw in sorted(future_n['event'].dropna().unique())[:10]:
             gw_fix = future_n[future_n['event'] == gw]
-            if gw_fix.empty: continue
-            avg_diff = gw_fix[['team_h_difficulty', 'team_a_difficulty']].mean().mean()
-            gw_scores.append({'gw': int(gw), 'avg_diff': round(avg_diff, 2)})
+            if not gw_fix.empty:
+                gw_scores.append({'gw': int(gw),
+                                   'avg_diff': round(gw_fix[['team_h_difficulty','team_a_difficulty']].mean().mean(), 2)})
         gw_df = pd.DataFrame(gw_scores).sort_values('avg_diff') if gw_scores else pd.DataFrame()
 
-        if 'wildcard' in remaining_chips:
+        if 'wildcard' in selected_chips:
             st.markdown("---")
             st.markdown("### 🃏 Wildcard")
-            wc_used_count = sum(1 for c in chips_played if c['name'] == 'wildcard')
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown(f"**{2 - wc_used_count} use(s) remaining this season**")
                 st.markdown("""
                 **Use when:**
                 - 4+ players you want to replace
                 - Major injury crisis across multiple positions
                 - Run of great fixtures for teams you don't own
-                - After a double GW announcement to fully restructure
+                - After a double GW announcement
                 """)
                 if not gw_df.empty:
                     best = gw_df.iloc[0]
-                    st.markdown(f"**Best upcoming GW:** GW{int(best['gw'])} *(avg difficulty {best['avg_diff']})*")
+                    st.markdown(f"**Best upcoming GW:** GW{int(best['gw'])} *(avg diff {best['avg_diff']})*")
             with c2:
-                my_pred_wc = predictions[predictions['player_id'].isin(my_squad_ids)].copy()
-                st.markdown("**Weakest players to replace:**")
-                for _, r in my_pred_wc.sort_values('xP').head(5).iterrows():
-                    st.markdown(
-                        f"<div style='background:#111;border:1px solid #222;border-radius:4px;"
-                        f"padding:8px 12px;margin:3px 0'>"
-                        f"<b>{r['player']}</b> ({r['position']}) — "
-                        f"xP: <span style='color:#ff4444'>{r['xP']}</span>"
-                        f"</div>", unsafe_allow_html=True)
+                if my_squad_ids:
+                    st.markdown("**Weakest to replace:**")
+                    for _, r in predictions[predictions['player_id'].isin(my_squad_ids)].sort_values('xP').head(5).iterrows():
+                        st.markdown(
+                            f"<div style='background:#111;border:1px solid #222;border-radius:4px;"
+                            f"padding:8px 12px;margin:3px 0'>"
+                            f"{r.get('form_tag','➡️')} <b>{r['player']}</b> ({r['position']}) — "
+                            f"xP: <span style='color:#ff4444'>{r['xP']}</span></div>",
+                            unsafe_allow_html=True)
 
-        if 'bboost' in remaining_chips:
+        if 'bboost' in selected_chips:
             st.markdown("---")
             st.markdown("### 🚀 Bench Boost")
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**1 use remaining this season**")
                 st.markdown("""
                 **Use when:**
-                - Double gameweek with 3-4 bench players who have doubles
-                - Your bench has strong fixtures that week
+                - Double GW with 3-4 bench players who have doubles
                 - Never use in a blank gameweek
                 """)
                 if not gw_df.empty:
                     best = gw_df.iloc[0]
-                    st.markdown(f"**Best upcoming GW:** GW{int(best['gw'])} *(avg difficulty {best['avg_diff']})*")
+                    st.markdown(f"**Best upcoming GW:** GW{int(best['gw'])} *(avg diff {best['avg_diff']})*")
             with c2:
                 if result:
                     bench_players = result['squad'][~result['squad']['is_starting']]
                     bench_xp      = bench_players['xP'].sum()
                     color         = "#00cc66" if bench_xp >= 12 else "#ff4444"
-                    st.markdown(f"**Current bench xP:** <span style='color:{color}'>{round(bench_xp,2)}</span>",
+                    st.markdown(f"**Bench xP:** <span style='color:{color}'>{round(bench_xp,2)}</span>",
                                 unsafe_allow_html=True)
                     for _, r in bench_players.iterrows():
-                        xp_col = "#00cc66" if r['xP'] > 3 else "#888"
+                        xp_c = "#00cc66" if r['xP'] > 3 else "#888"
                         st.markdown(
                             f"<div style='background:#111;border:1px solid #222;border-radius:4px;"
                             f"padding:8px 12px;margin:3px 0'>"
                             f"<b>{r['player']}</b> ({r['position']}) — "
-                            f"xP: <span style='color:{xp_col}'>{r['xP']}</span> | {r['opponent']}"
-                            f"</div>", unsafe_allow_html=True)
+                            f"xP: <span style='color:{xp_c}'>{r['xP']}</span> | {r['opponent']}</div>",
+                            unsafe_allow_html=True)
                     if bench_xp < 12:
-                        st.warning("⚠️ Bench xP is low. Upgrade bench before using Bench Boost.")
+                        st.warning("⚠️ Bench xP is low. Upgrade bench before using this.")
 
-        if 'freehit' in remaining_chips:
+        if 'freehit' in selected_chips:
             st.markdown("---")
             st.markdown("### 🎯 Free Hit")
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**1 use remaining this season**")
                 st.markdown("""
                 **Use when:**
                 - Blank gameweek — field a full 11 playing players
-                - Squad resets after, never waste on a normal GW
-                - Best saved for the largest blank GW of the season
+                - Squad resets after — never waste on a normal GW
                 """)
                 if not gw_df.empty:
                     best = gw_df.iloc[0]
-                    st.markdown(f"**Best upcoming GW:** GW{int(best['gw'])} *(avg difficulty {best['avg_diff']})*")
+                    st.markdown(f"**Best upcoming GW:** GW{int(best['gw'])} *(avg diff {best['avg_diff']})*")
             with c2:
                 st.markdown(f"**Optimal Free Hit squad GW{next_gw}:**")
                 fh_result = optimize_squad(predictions, budget=104.0,
@@ -1107,34 +1295,32 @@ with tab8:
                         column_config={
                             'price': st.column_config.NumberColumn("£",  format="£%.1f"),
                             'xP':    st.column_config.NumberColumn("xP", format="%.2f"),
-                        },
-                        use_container_width=True, hide_index=True
-                    )
+                        }, use_container_width=True, hide_index=True)
 
-        if '3xc' in remaining_chips:
+        if '3xc' in selected_chips:
             st.markdown("---")
             st.markdown("### ⚡ Triple Captain")
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**1 use remaining this season**")
                 st.markdown("""
                 **Use when:**
-                - Your captain pick has a double gameweek
+                - Your captain has a double gameweek
                 - Exceptional form + easy fixture (diff 1-2)
-                - Never use on a difficulty 4-5 fixture
+                - Never on a difficulty 4-5 fixture
                 """)
             with c2:
-                st.markdown(f"**Best Triple Captain candidates GW{next_gw}:**")
-                tc_df = available[available['captain_score'] > 0].sort_values(
-                    'captain_score', ascending=False).head(5)
-                for i, (_, r) in enumerate(tc_df.iterrows()):
+                st.markdown(f"**Best candidates GW{next_gw}:**")
+                for i, (_, r) in enumerate(
+                    available[available['captain_score'] > 0].sort_values(
+                        'captain_score', ascending=False).head(5).iterrows()):
                     diff_color = "#00cc66" if r['difficulty'] <= 2 else "#f0a500" if r['difficulty'] == 3 else "#ff4444"
                     rank_color = "#f0a500" if i == 0 else "#888"
                     st.markdown(
                         f"<div style='background:#111;border:1px solid #222;border-radius:4px;"
                         f"padding:8px 12px;margin:3px 0'>"
                         f"<span style='color:{rank_color};font-weight:700'>{i+1}.</span> "
+                        f"{r.get('form_tag','➡️')} {r.get('odds_tag','➖')} "
                         f"<b>{r['player']}</b> ({r['team']}) — "
-                        f"xP: <b>{r['xP']}</b> | Cap Score: <b>{r['captain_score']}</b> | "
+                        f"xP: <b>{r['xP']}</b> | Cap: <b>{r['captain_score']}</b> | "
                         f"vs {r['opponent']} <span style='color:{diff_color}'>[diff {r['difficulty']}]</span>"
                         f"</div>", unsafe_allow_html=True)
