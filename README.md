@@ -24,8 +24,6 @@ Most FPL managers rely on gut feel, forums, or outdated spreadsheets. This tool 
 
 ## 🖥️ Demo
 
-> *Screenshot or GIF of the Streamlit dashboard — add yours here*
-
 ```
 streamlit run app.py
 ```
