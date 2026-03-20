@@ -183,7 +183,6 @@ The optimizer then takes the predicted xP values and solves for the maximum-scor
 - [ ] Captain and vice-captain optimization
 - [ ] Chip strategy (Triple Captain, Free Hit, Bench Boost) planner
 - [ ] Mini-league rank tracker
-- [ ] M-Pesa paywall integration for premium access
 - [ ] Mobile-responsive UI
 
 ---
