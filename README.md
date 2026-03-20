@@ -205,7 +205,7 @@ Pull requests are welcome. For major changes, please open an issue first.
 BSc Data Science — KCA University, Nairobi
 
 [![GitHub](https://img.shields.io/badge/GitHub-Bachu33-181717?style=flat&logo=github)](https://github.com/Bachu33)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2?style=flat&logo=linkedin)](https:www.linkedin.com/in/abdikadirhussseinbachu)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2?style=flat&logo=linkedin)](https://www.linkedin.com/in/abdikadirhusseinbachu)
 
 ---
 
